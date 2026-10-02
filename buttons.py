@@ -20,7 +20,7 @@ from common import (
     label, leave_text, me_text, mention, next_action, queue_text, remember, title, user_link,
 )
 from keyboards import (
-    ALL, AdmCb, MenuCb, SubjCb, admin_kb, main_menu_kb, queue_kb, subjects_kb,
+    ALL, AdmCb, CloseCb, MenuCb, SubjCb, admin_kb, main_menu_kb, queue_kb, subjects_kb,
 )
 from schedule import today_text
 from subjects import NO_TOPIC, has_topics
@@ -36,7 +36,7 @@ class JoinForm(StatesGroup):
 
 
 def ask(text: str) -> ForceReply:
-    """Поле ответа сразу открывается у того, кого спросили."""
+    """Поле «Ответить» сразу открывается у того, кого спросили."""
     return ForceReply(selective=True, input_field_placeholder=text)
 
 
@@ -173,6 +173,13 @@ async def cancel(message: Message, state: FSMContext) -> None:
     forget(message, await message.answer("Запись отменена."), delay=CLEANUP_DELAY)
 
 
+@router.callback_query(CloseCb.filter())
+async def on_close(cb: CallbackQuery) -> None:
+    """Кнопка «Закрыть» / «Отмена» в меню и списках — просто убрать сообщение."""
+    forget(cb.message, delay=0)
+    await cb.answer()
+
+
 @router.message(JoinForm.topic, F.text, is_answer)
 async def got_topic(message: Message, state: FSMContext) -> None:
     text = message.text.strip()
@@ -182,7 +189,10 @@ async def got_topic(message: Message, state: FSMContext) -> None:
         return
     await state.update_data(topic=int(text))
     await state.set_state(JoinForm.work)
-    await add_trash(state, message, await message.reply("Теперь номер ПР.", reply_markup=ask("Например: 2")))
+    await add_trash(
+        state, message,
+        await message.reply("Теперь номер ПР.", reply_markup=ask("Например: 2")),
+    )
 
 
 @router.message(JoinForm.work, F.text, is_answer)
@@ -209,6 +219,10 @@ async def on_admin(cb: CallbackQuery, callback_data: AdmCb) -> None:
         await cb.answer("Это только для старосты.", show_alert=True)
         return
     subject, action = callback_data.subject, callback_data.action
+    if action == "close":
+        forget(cb.message, delay=0)
+        await cb.answer()
+        return
 
     result, called = "", None
     if action == "next":
