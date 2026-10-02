@@ -9,7 +9,7 @@ ALL = "*"  # «все предметы» в кнопке показа очере
 
 
 class MenuCb(CallbackData, prefix="m"):
-    action: str  # join | leave | queue | me | admin
+    action: str  # join | leave | queue | me | today | admin
 
 
 class SubjCb(CallbackData, prefix="s"):
@@ -28,8 +28,9 @@ def main_menu_kb() -> InlineKeyboardMarkup:
     b.button(text="🚪 Выйти из очереди", callback_data=MenuCb(action="leave"))
     b.button(text="📋 Очереди", callback_data=MenuCb(action="queue"))
     b.button(text="👤 Мои записи", callback_data=MenuCb(action="me"))
+    b.button(text="🕒 Сегодня", callback_data=MenuCb(action="today"))
     b.button(text="🎓 Для старосты", callback_data=MenuCb(action="admin"))
-    b.adjust(2, 2, 1)
+    b.adjust(2, 2, 2)
     return b.as_markup()
 
 

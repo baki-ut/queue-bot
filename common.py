@@ -9,6 +9,7 @@ from aiogram.types import User
 from dotenv import load_dotenv
 
 from db import Database, Entry, JoinResult
+from schedule import block_label, can_join, is_expired, now_msk, queue_block
 from subjects import SUBJECTS, work_label
 
 # ---------- настройки из .env ----------
@@ -20,6 +21,8 @@ MAX_WORK = int(os.getenv("MAX_WORK", "10"))
 MAX_TOPIC = int(os.getenv("MAX_TOPIC", "10"))
 _chat = os.getenv("ALLOWED_CHAT_ID", "").strip()
 ALLOWED_CHAT_ID = int(_chat) if _chat else None
+# 0 — отключить ограничения по расписанию (удобно для проверки бота ночью)
+SCHEDULE_ENABLED = os.getenv("SCHEDULE_ENABLED", "1").strip() != "0"
 
 db = Database(os.getenv("DB_PATH", "queue.db"))
 
@@ -45,10 +48,17 @@ def user_link(user: User) -> str:
     return f'<a href="tg://user?id={user.id}">{escape(user.full_name)}</a>'
 
 
+def queue_header(subject: str) -> str:
+    """«РБД (пара пн 05.10, 16:20):» — на какую практику эта очередь."""
+    block = queue_block(subject)
+    when = f" (пара {block_label(block)})" if block else ""
+    return f"<b>{title(subject)}</b>{when}:"
+
+
 def format_queue(subject: str, queue: list[Entry]) -> str:
     if not queue:
-        return f"<b>{title(subject)}:</b> очередь пуста."
-    lines = [f"<b>{title(subject)}:</b>"]
+        return f"{queue_header(subject)} очередь пуста."
+    lines = [queue_header(subject)]
     for i, e in enumerate(queue, start=1):
         mark = " ← сдаёт" if e.called else ""
         lines.append(f"{i}. {escape(e.full_name)} — {label(e)}{mark}")
@@ -98,6 +108,11 @@ def check_topic(topic: int) -> str | None:
     return None
 
 
+def join_closed(subject: str) -> str | None:
+    """Причина, по которой сейчас нельзя записаться, или None."""
+    return can_join(subject) if SCHEDULE_ENABLED else None
+
+
 def check_work(work_num: int) -> str | None:
     if not 1 <= work_num <= MAX_WORK:
         return f"Номер работы — от 1 до {MAX_WORK}."
@@ -107,18 +122,26 @@ def check_work(work_num: int) -> str | None:
 async def join_text(user: User, subject: str, topic: int, work_num: int) -> str:
     """Записать в очередь и вернуть ответ для пользователя. Номера уже проверены."""
     await remember(user)
+    closed = join_closed(subject)  # время могло выйти, пока человек вводил номер
+    if closed:
+        return closed
     what = work_label(subject, topic, work_num)
     result = await db.join(user.id, subject, topic, work_num)
-    if result is JoinResult.ALREADY_SUBMITTED:
-        return f"{title(subject)}, {what} у вас уже сдана."
     if result is JoinResult.ALREADY_IN_QUEUE:
         return (
             f"Вы уже в очереди по {title(subject)}. "
             "Чтобы сменить работу, сначала выйдите из этой очереди."
         )
     pos, _ = await db.position(user.id, subject)
+    block = queue_block(subject)
+    if block is None:
+        when = ""
+    elif block.start <= now_msk():
+        when = f" на текущую пару (до {block.end:%H:%M})"
+    else:
+        when = f" на пару {block_label(block)}"
     return (
-        f"{escape(user.full_name)} записан(а): {title(subject)}, {what}. "
+        f"{escape(user.full_name)} записан(а){when}: {title(subject)}, {what}. "
         f"Место в очереди: {pos}."
     )
 
@@ -130,7 +153,7 @@ async def leave_text(user_id: int, subject: str) -> str:
 
 
 async def me_text(user_id: int) -> str:
-    """Мои очереди и сданные работы — обычный текст без разметки."""
+    """Мои очереди — обычный текст без разметки."""
     lines = ["В очереди:"]
     subjects_in_queue = await db.my_queues(user_id)
     if subjects_in_queue:
@@ -139,15 +162,6 @@ async def me_text(user_id: int) -> str:
             lines.append(f"• {title(subject)}, {label(entry)} — место {pos}")
     else:
         lines.append("нигде")
-    lines.append("\nСдано:")
-    done = await db.submitted_works(user_id)
-    if done:
-        for subject, works in done.items():
-            lines.append(
-                f"• {title(subject)}: " + ", ".join(work_label(subject, t, n) for t, n in works)
-            )
-    else:
-        lines.append("пока ничего")
     return "\n".join(lines)
 
 
@@ -168,10 +182,10 @@ async def next_action(bot: Bot, subject: str) -> tuple[str, Entry | None]:
 
 async def finish_action(bot: Bot, subject: str, submitted: bool) -> tuple[str, Entry | None]:
     """Отметить текущего и вызвать следующего. Возвращает (текст, кого вызвали)."""
-    finished, called = await db.finish_current(subject, submitted)
+    finished, called = await db.finish_current(subject)
     if finished is None:
         return f"{title(subject)}: сейчас никто не сдаёт. Сначала вызовите следующего.", None
-    verdict = "сдал(а)" if submitted else "убран(а) без зачёта"
+    verdict = "сдал(а)" if submitted else "не сдал(а), убран(а) из очереди"
     text = f"{title(subject)}: {escape(finished.full_name)} {verdict}, {label(finished)}."
     if called:
         await notify(bot, called)
@@ -179,3 +193,10 @@ async def finish_action(bot: Bot, subject: str, submitted: bool) -> tuple[str, E
     else:
         text += "\nОчередь пуста."
     return text, called
+
+
+async def purge_finished() -> None:
+    """Очистить очереди на практики, которые уже закончились."""
+    removed = await db.purge(is_expired)
+    for subject, count in removed.items():
+        logging.info("Практика по %s закончилась — убрано записей: %s", title(subject), count)

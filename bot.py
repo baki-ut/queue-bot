@@ -10,15 +10,29 @@ from aiogram.types import BotCommand
 import buttons
 import commands
 from access import GroupOnlyMiddleware
-from common import ALLOWED_CHAT_ID, TOKEN, db
+from common import ALLOWED_CHAT_ID, TOKEN, db, purge_finished
 
 BOT_COMMANDS = [
     BotCommand(command="menu", description="Меню с кнопками"),
     BotCommand(command="queue", description="Все очереди"),
     BotCommand(command="me", description="Мои записи"),
+    BotCommand(command="today", description="Пары сегодня и когда можно записаться"),
     BotCommand(command="cancel", description="Отменить запись"),
     BotCommand(command="help", description="Справка"),
 ]
+
+
+PURGE_EVERY_SECONDS = 30
+
+
+async def purge_loop() -> None:
+    """Раз в полминуты убирать записи на закончившиеся пары."""
+    while True:
+        try:
+            await purge_finished()
+        except Exception:
+            logging.exception("Не удалось очистить очереди")
+        await asyncio.sleep(PURGE_EVERY_SECONDS)
 
 
 async def main() -> None:
@@ -35,9 +49,11 @@ async def main() -> None:
     await db.connect()
     bot = Bot(TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
     await bot.set_my_commands(BOT_COMMANDS)  # подсказки при вводе «/»
+    purger = asyncio.create_task(purge_loop())  # сразу же чистит то, что прошло, пока бот стоял
     try:
         await dp.start_polling(bot)
     finally:
+        purger.cancel()
         await db.close()
 
 

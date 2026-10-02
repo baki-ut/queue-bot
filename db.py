@@ -1,15 +1,23 @@
 """Хранилище очередей на SQLite.
 
-У каждого предмета своя очередь. Правило приоритета внутри предмета:
-сначала тот, кого уже вызвали сдавать, затем ожидающие по теме
-(у предметов без тем она всегда 0), потом по номеру работы
-(меньший — раньше), а при равенстве — по времени записи.
+У каждого предмета своя очередь — на ближайшую (или идущую сейчас) практику.
+Когда практика заканчивается (у сдвоенной — после второй пары), записи,
+сделанные до её конца, удаляются: дальше идёт запись на следующую практику.
+
+Правило приоритета внутри предмета: сначала тот, кого уже вызвали сдавать,
+затем ожидающие по теме (у предметов без тем она всегда 0), потом по номеру
+работы (меньший — раньше), а при равенстве — по времени записи.
 """
 import asyncio
+import time
 from dataclasses import dataclass
+from datetime import datetime
 from enum import Enum, auto
+from typing import Callable
 
 import aiosqlite
+
+from subjects import RENAMED
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS users (
@@ -17,21 +25,14 @@ CREATE TABLE IF NOT EXISTS users (
     full_name TEXT NOT NULL
 );
 CREATE TABLE IF NOT EXISTS queue (
-    id       INTEGER PRIMARY KEY AUTOINCREMENT,  -- порядок записи
-    tg_id    INTEGER NOT NULL REFERENCES users(tg_id),
-    subject  TEXT    NOT NULL,
-    topic    INTEGER NOT NULL DEFAULT 0,         -- 0 = у предмета нет тем
-    work_num INTEGER NOT NULL,
-    called   INTEGER NOT NULL DEFAULT 0,         -- 1 = сейчас сдаёт
-    UNIQUE (tg_id, subject)                      -- одно место на предмет
-);
-CREATE TABLE IF NOT EXISTS submissions (
-    tg_id        INTEGER NOT NULL REFERENCES users(tg_id),
-    subject      TEXT    NOT NULL,
-    topic        INTEGER NOT NULL DEFAULT 0,
-    work_num     INTEGER NOT NULL,
-    submitted_at TEXT    NOT NULL DEFAULT CURRENT_TIMESTAMP,
-    PRIMARY KEY (tg_id, subject, topic, work_num)
+    id        INTEGER PRIMARY KEY AUTOINCREMENT,  -- порядок записи
+    tg_id     INTEGER NOT NULL REFERENCES users(tg_id),
+    subject   TEXT    NOT NULL,
+    topic     INTEGER NOT NULL DEFAULT 0,         -- 0 = у предмета нет тем
+    work_num  INTEGER NOT NULL,
+    called    INTEGER NOT NULL DEFAULT 0,         -- 1 = сейчас сдаёт
+    joined_ts INTEGER NOT NULL DEFAULT 0,         -- когда записался (unix-время)
+    UNIQUE (tg_id, subject)                       -- одно место на предмет
 );
 """
 
@@ -42,7 +43,6 @@ QUEUE_ORDER = "ORDER BY q.called DESC, q.topic, q.work_num, q.id"
 class JoinResult(Enum):
     OK = auto()
     ALREADY_IN_QUEUE = auto()
-    ALREADY_SUBMITTED = auto()
 
 
 @dataclass
@@ -67,7 +67,23 @@ class Database:
         self._conn = await aiosqlite.connect(self.path)
         await self._conn.execute("PRAGMA foreign_keys = ON")
         await self._conn.executescript(SCHEMA)
+        await self._migrate()
         await self._conn.commit()
+
+    async def _migrate(self) -> None:
+        """Подтянуть базу, созданную старыми версиями бота."""
+        cur = await self._conn.execute("PRAGMA table_info(queue)")
+        columns = {row[1] for row in await cur.fetchall()}
+        if "joined_ts" not in columns:
+            await self._conn.execute(
+                "ALTER TABLE queue ADD COLUMN joined_ts INTEGER NOT NULL DEFAULT 0"
+            )
+            # старым записям ставим «записались сейчас» — очистятся после ближайшей пары
+            await self._conn.execute("UPDATE queue SET joined_ts = ?", (int(time.time()),))
+        for old_name, new_name in RENAMED.items():  # переименованные предметы
+            await self._conn.execute(
+                "UPDATE queue SET subject = ? WHERE subject = ?", (new_name, old_name)
+            )
 
     async def close(self) -> None:
         if self._conn:
@@ -106,20 +122,14 @@ class Database:
     async def join(self, tg_id: int, subject: str, topic: int, work_num: int) -> JoinResult:
         async with self._lock:
             cur = await self._conn.execute(
-                "SELECT 1 FROM submissions "
-                "WHERE tg_id = ? AND subject = ? AND topic = ? AND work_num = ?",
-                (tg_id, subject, topic, work_num),
-            )
-            if await cur.fetchone():
-                return JoinResult.ALREADY_SUBMITTED
-            cur = await self._conn.execute(
                 "SELECT 1 FROM queue WHERE tg_id = ? AND subject = ?", (tg_id, subject)
             )
             if await cur.fetchone():
                 return JoinResult.ALREADY_IN_QUEUE
             await self._conn.execute(
-                "INSERT INTO queue(tg_id, subject, topic, work_num) VALUES (?, ?, ?, ?)",
-                (tg_id, subject, topic, work_num),
+                "INSERT INTO queue(tg_id, subject, topic, work_num, joined_ts) "
+                "VALUES (?, ?, ?, ?, ?)",
+                (tg_id, subject, topic, work_num, int(time.time())),
             )
             await self._conn.commit()
             return JoinResult.OK
@@ -131,6 +141,27 @@ class Database:
             )
             await self._conn.commit()
             return cur.rowcount > 0
+
+    async def purge(self, is_expired: Callable[[str, datetime], bool]) -> dict[str, int]:
+        """Удалить записи на уже прошедшие пары.
+
+        is_expired(предмет, когда записался) решает, закончилась ли та пара.
+        Возвращает {предмет: сколько записей удалено}.
+        """
+        async with self._lock:
+            cur = await self._conn.execute("SELECT id, subject, joined_ts FROM queue")
+            expired = [
+                (row_id, subject)
+                for row_id, subject, ts in await cur.fetchall()
+                if is_expired(subject, datetime.fromtimestamp(ts).astimezone())
+            ]
+            removed: dict[str, int] = {}
+            for row_id, subject in expired:
+                await self._conn.execute("DELETE FROM queue WHERE id = ?", (row_id,))
+                removed[subject] = removed.get(subject, 0) + 1
+            if expired:
+                await self._conn.commit()
+            return removed
 
     async def _call_next_unlocked(self, subject: str) -> Entry | None:
         cur = await self._conn.execute(
@@ -152,13 +183,8 @@ class Database:
                 return queue[0], None
             return None, await self._call_next_unlocked(subject)
 
-    async def finish_current(
-        self, subject: str, submitted: bool
-    ) -> tuple[Entry | None, Entry | None]:
-        """Убрать того, кто сдаёт (засчитав работу или нет), и вызвать следующего.
-
-        Возвращает (закончивший, следующий).
-        """
+    async def finish_current(self, subject: str) -> tuple[Entry | None, Entry | None]:
+        """Убрать того, кто сдаёт, и вызвать следующего. Возвращает (закончивший, следующий)."""
         async with self._lock:
             queue = await self.get_queue(subject)
             if not queue or not queue[0].called:
@@ -168,28 +194,8 @@ class Database:
                 "DELETE FROM queue WHERE tg_id = ? AND subject = ?",
                 (current.tg_id, subject),
             )
-            if submitted:
-                await self._conn.execute(
-                    "INSERT OR IGNORE INTO submissions(tg_id, subject, topic, work_num) "
-                    "VALUES (?, ?, ?, ?)",
-                    (current.tg_id, subject, current.topic, current.work_num),
-                )
             await self._conn.commit()
             return current, await self._call_next_unlocked(subject)
-
-    # ---------- сданные работы ----------
-
-    async def submitted_works(self, tg_id: int) -> dict[str, list[tuple[int, int]]]:
-        """Сданные работы по предметам: {"мпс": [(1, 1), (1, 2)], "рбд": [(0, 1)]}."""
-        cur = await self._conn.execute(
-            "SELECT subject, topic, work_num FROM submissions WHERE tg_id = ? "
-            "ORDER BY subject, topic, work_num",
-            (tg_id,),
-        )
-        result: dict[str, list[tuple[int, int]]] = {}
-        for subject, topic, work_num in await cur.fetchall():
-            result.setdefault(subject, []).append((topic, work_num))
-        return result
 
     async def my_queues(self, tg_id: int) -> list[str]:
         cur = await self._conn.execute(

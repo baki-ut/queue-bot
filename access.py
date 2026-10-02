@@ -3,7 +3,7 @@
 Бот отвечает:
 - в группе с ID из ALLOWED_CHAT_ID;
 - в личке — только участникам этой группы.
-Из чужих групп бот сразу выходит.
+В чужих группах бот молчит и пишет их ID в лог.
 """
 import logging
 import time
@@ -54,12 +54,12 @@ class GroupOnlyMiddleware(BaseMiddleware):
         if chat.type in (ChatType.GROUP, ChatType.SUPERGROUP):
             if chat.id == self.allowed_chat_id:
                 return await handler(event, data)
-            logging.info("Выхожу из чужой группы %s (%s)", chat.id, chat.title)
-            try:
-                await event.answer("Этот бот работает только в своей учебной группе.")
-                await bot.leave_chat(chat.id)
-            except TelegramAPIError:
-                pass
+            # Из группы не выходим: при опечатке в ALLOWED_CHAT_ID бот иначе
+            # покинул бы собственную группу. Просто молчим и пишем ID в лог.
+            logging.warning(
+                "Сообщение из группы %s (%s), а ALLOWED_CHAT_ID=%s — игнорирую",
+                chat.id, chat.title, self.allowed_chat_id,
+            )
             return None
 
         if chat.type == ChatType.PRIVATE and event.from_user:

@@ -80,6 +80,84 @@ scp root@IP_СЕРВЕРА:/home/bot/queue-bot/queue.db .
 
 **Если обновление поменяло структуру таблиц**, бот при запуске упадёт с ошибкой про колонки. Тогда сделайте копию, как выше, удалите `queue.db` и перезапустите бота — он создаст базу заново. Очередь при этом обнулится.
 
+## Работа с базой через sqlite3
+
+Один раз установить клиент: `apt install -y sqlite3`
+
+### Как зайти и выйти
+
+```bash
+sqlite3 /home/bot/queue-bot/queue.db
+```
+
+Приглашение сменится на `sqlite>` — теперь вводится SQL, а не команды Linux.
+
+```sql
+.headers on       -- показывать названия колонок
+.mode column      -- выводить таблицей
+.tables           -- список таблиц
+.schema queue     -- структура таблицы
+.quit             -- выйти обратно в терминал
+```
+
+Каждый SQL-запрос заканчивается `;`. Если видно `...>` — забыли `;`, допишите и нажмите Enter.
+
+Запрос можно выполнить и без входа, одной строкой:
+
+```bash
+sqlite3 /home/bot/queue-bot/queue.db "SELECT * FROM queue;"
+```
+
+### Таблицы
+
+| Таблица | Что хранит |
+|---|---|
+| `users` | Telegram ID (`tg_id`) и имя (`full_name`) |
+| `queue` | текущие очереди: `tg_id`, `subject`, `topic` (0 — без темы), `work_num`, `called` (1 — сейчас сдаёт), `joined_ts` (когда записался, unix-время) |
+
+Очереди на закончившиеся пары бот очищает сам, раз в 30 секунд. Если в старой базе осталась таблица `submissions`, она больше не используется — её можно удалить: `DROP TABLE submissions;`
+
+Предметы пишутся маленькими буквами: `'мбп'`, `'оирткпс'`, `'тестирование'`, `'рбд'`, `'котлин'`.
+
+### Посмотреть
+
+```sql
+-- очередь по предмету в том порядке, как её видит бот
+SELECT u.full_name, q.topic, q.work_num, q.called
+FROM queue q JOIN users u USING(tg_id)
+WHERE q.subject = 'рбд'
+ORDER BY q.called DESC, q.topic, q.work_num, q.id;
+
+-- когда кто записался (по московскому времени)
+SELECT u.full_name, q.subject, datetime(q.joined_ts, 'unixepoch', '+3 hours') AS joined
+FROM queue q JOIN users u USING(tg_id)
+ORDER BY q.joined_ts;
+
+-- найти tg_id человека по имени
+SELECT tg_id, full_name FROM users WHERE full_name LIKE '%Иван%';
+```
+
+### Изменить
+
+**Перед изменениями — бэкап** (см. выше), а для массовых правок лучше остановить бота: `systemctl stop queue-bot`, потом `systemctl start queue-bot`.
+
+```sql
+-- очистить ВСЕ очереди
+DELETE FROM queue;
+
+-- очистить очередь одного предмета
+DELETE FROM queue WHERE subject = 'мбп';
+
+-- убрать одного человека из очереди
+DELETE FROM queue WHERE tg_id = 123456789 AND subject = 'рбд';
+
+-- снять отметку «сейчас сдаёт», не удаляя из очереди
+UPDATE queue SET called = 0 WHERE subject = 'рбд';
+
+```
+
+⚠️ Подтверждения нет: `DELETE` без `WHERE` удаляет всю таблицу сразу.
+
 ## Нагрузка на сервер
 
 ```bash
